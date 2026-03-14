@@ -446,9 +446,17 @@ def torchrun_uid_init_bcast_object_no_reinit(cp_group=None):
     else:
         broadcast_objects = [None]
 
+    # `broadcast_object_list(..., group=...)` expects a global rank for `src`.
+    # When using a subgroup (e.g. CP group [4, 5]), hard-coding `src=0` raises:
+    # "Global rank 0 is not part of group ...".
+    if cp_group is None:
+        bcast_src_global_rank = 0
+    else:
+        bcast_src_global_rank = dist.get_global_rank(cp_group, 0)
+
     dist.broadcast_object_list(
         broadcast_objects,
-        src=0,
+        src=bcast_src_global_rank,
         group=cp_group
     )
 

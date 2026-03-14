@@ -42,7 +42,10 @@ from transformer_engine.pytorch.cpp_extensions.fused_attn import (
 from transformer_engine.pytorch.fp8 import get_fp8_torch_dtype
 from transformer_engine.pytorch.distributed import get_distributed_world_size
 from transformer_engine.pytorch.jit import no_torch_dynamo
-from transformer_engine.pytorch.attention.dot_product_attention.context_parallel import (
+# from transformer_engine.pytorch.attention.dot_product_attention.context_parallel import (
+#     attn_forward_func_with_cp,
+# )
+from transformer_engine.pytorch.attention.dot_product_attention.context_parallel_nvshmem import (
     attn_forward_func_with_cp,
 )
 from transformer_engine.pytorch.attention.dot_product_attention.softmax import FusedScaleMaskSoftmax
