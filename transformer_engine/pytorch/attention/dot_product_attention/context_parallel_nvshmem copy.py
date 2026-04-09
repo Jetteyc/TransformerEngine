@@ -6,8 +6,7 @@
 from contextlib import contextmanager
 import importlib
 import os
-import sys
-from typing import List, Union
+from typing import List, Optional, Union
 import torch
 import transformer_engine_torch as tex
 import nvshmem.core as nvshmem  
@@ -54,8 +53,6 @@ _cu_seqlens_info_with_cp_cache = {}
 _seq_chunk_ids_cache_for_reordering_before_attn = {}
 _seq_chunk_ids_cache_for_reordering_after_attn = {}
 _NVSHMEM_UID_INIT_DONE_KEYS = set()
-_CP_NE_STREAM_FALLBACK_LOGGED = False
-_CP_NE_STREAM_ATTACH_LOGGED = False
 
 
 def _cp_comm_nvtx_enabled() -> bool:
@@ -74,63 +71,32 @@ def _cp_comm_nvtx(name: str):
         yield
 
 
-def _as_nvshmem_stream(stream: Union[Stream, torch.cuda.Stream, None]) -> Stream:
-    if stream is None:
-        return Stream.from_handle(torch.cuda.current_stream().cuda_stream)
-    if isinstance(stream, Stream):
-        return stream
-    return Stream.from_handle(stream.cuda_stream)
-
-
-def _sync_stream(stream: Union[Stream, torch.cuda.Stream, None]) -> None:
-    if stream is None:
-        return
-    if hasattr(stream, "sync"):
-        stream.sync()
-        return
-    if hasattr(stream, "synchronize"):
-        stream.synchronize()
-
-
-def _get_cp_intranode_stream_from_ne() -> Union[Stream, None]:
-    """Get CP intranode stream from NetworkEngine. Fallback to local stream if unavailable."""
-    global _CP_NE_STREAM_FALLBACK_LOGGED
-    global _CP_NE_STREAM_ATTACH_LOGGED
+def _is_cp_peer_intranode(peer_rank: int) -> Optional[bool]:
+    """Best-effort CP peer scope check with NetworkEngine diagnostics."""
+    if not torch.distributed.is_available() or not torch.distributed.is_initialized():
+        return None
     try:
         ne_module = importlib.import_module("megatron.core.network_engine")
         enums_module = importlib.import_module("megatron.core.network_engine.enums")
         get_global_network_engine = getattr(ne_module, "get_global_network_engine", None)
         ParallelDomain = getattr(enums_module, "ParallelDomain", None)
         if get_global_network_engine is None or ParallelDomain is None:
-            raise RuntimeError("NetworkEngine symbols not found")
+            return None
 
         ne = get_global_network_engine()
-        if ne is None:
-            raise RuntimeError("global NetworkEngine is None")
+        world_rank = torch.distributed.get_rank()
 
-        ne_stream = ne.get_comm_stream_for_domain(
-            domain=ParallelDomain.CP,
-            intranode=True,
-        )
-        if ne_stream is None:
-            raise RuntimeError("NetworkEngine returned None stream for CP intranode")
-
-        if not _CP_NE_STREAM_ATTACH_LOGGED:
-            _CP_NE_STREAM_ATTACH_LOGGED = True
-            print(
-                f"[CP-NVSHMEM] attached to NetworkEngine CP intranode stream: {ne_stream}",
-                file=sys.stderr,
+        # Emit NetworkEngine peer-level stream diagnostics when available.
+        get_p2p_stream_for_peer = getattr(ne, "get_p2p_stream_for_peer", None)
+        if get_p2p_stream_for_peer is not None:
+            get_p2p_stream_for_peer(
+                domain=ParallelDomain.CP,
+                peer_rank=int(peer_rank),
+                local_rank=world_rank,
             )
 
-        return _as_nvshmem_stream(ne_stream)
-    except Exception as exc:
-        if not _CP_NE_STREAM_FALLBACK_LOGGED:
-            _CP_NE_STREAM_FALLBACK_LOGGED = True
-            print(
-                "[CP-NVSHMEM][Fallback] failed to get NetworkEngine CP intranode stream; "
-                f"fallback to local stream. reason={exc}",
-                file=sys.stderr,
-            )
+        return ne.policy.is_intranode_rank_pair(world_rank, int(peer_rank))
+    except Exception:
         return None
 
 
@@ -503,13 +469,12 @@ def get_fa_args(
         dv,
     ]
 
-def nvshmem_get_on_stream(
-    dst_tensor: torch.Tensor,
-    src_tensor: torch.Tensor,
-    peer: int,
-    stream: Union[Stream, torch.cuda.Stream, None] = None,
-) -> None:
-    nvshmem.get(dst_tensor, src_tensor, remote_pe=peer, stream=_as_nvshmem_stream(stream))
+def nvshmem_get_on_stream(dst_tensor: torch.Tensor, src_tensor: torch.Tensor,   
+                    peer: int, stream: Stream = None) -> None:  
+    if stream is None:  
+        stream = Stream.from_handle(torch.cuda.current_stream().cuda_stream)  
+    
+    nvshmem.get(dst_tensor, src_tensor, remote_pe=peer, stream=stream)  
 
 def torchrun_uid_init_bcast_object_no_reinit(cp_group=None):
     # Guard: uid broadcast/init must run at most once per process-group per process.
@@ -873,10 +838,9 @@ class AttnFuncWithCPAndKVP2P(torch.autograd.Function):
         # p2p_comm_buffers[0] = nvshmem.tensor(list(p2p_comm_buffers[0].shape), dtype=p2p_comm_buffers[0].dtype)
         # p2p_comm_buffers[0].copy_(p2p_comm_buffers[0])
         # p2p_comm_buffers[1] = nvshmem.tensor(list(p2p_comm_buffers[0].shape), dtype=p2p_comm_buffers[0].dtype)
-        communicate_stream = _get_cp_intranode_stream_from_ne()
-        if communicate_stream is None:
-            device = Device()
-            communicate_stream = device.create_stream()
+        device = Device()
+        communicate_stream_intranode = device.create_stream()
+        communicate_stream_internode = device.create_stream()
         out = None
         for i in range(cp_size + 1):
             if i < cp_size:
@@ -886,7 +850,8 @@ class AttnFuncWithCPAndKVP2P(torch.autograd.Function):
                         req.wait()
                     if nvshmem_kv is not None:
                         # If NVSHMEM is available, ensure the get is completed before using the buffer
-                        _sync_stream(communicate_stream)
+                        communicate_stream_intranode.sync()
+                        communicate_stream_internode.sync()
 
                     if i < (cp_size - 1):                 
                         p2p_comm_buffers[i + 1] = nvshmem.tensor(list(p2p_comm_buffers[i].shape), dtype=p2p_comm_buffers[i].dtype)                      
@@ -896,6 +861,12 @@ class AttnFuncWithCPAndKVP2P(torch.autograd.Function):
                             # Map owner idx to global rank (accounting for a2a groups)
                             owner_global = cp_global_ranks[owner_idx * cp_size_a2a + rank_a2a]
                             # nvshmem_get: dst (local buffer), src (symmetric address), peer=owner_global
+                            owner_intranode = _is_cp_peer_intranode(int(owner_global))
+                            communicate_stream = (
+                                communicate_stream_intranode
+                                if owner_intranode is True
+                                else communicate_stream_internode
+                            )
                             nvshmem_get_on_stream(
                                 p2p_comm_buffers[i + 1],
                                 nvshmem_kv,
@@ -1942,9 +1913,14 @@ class AttnFuncWithCPAndKVP2P(torch.autograd.Function):
 
         device = Device(torch.cuda.current_device())
         device.set_current()
-        communicate_stream = _get_cp_intranode_stream_from_ne()
-        if communicate_stream is None:
-            communicate_stream = device.create_stream()
+        communicate_stream_intranode = device.create_stream()
+        communicate_stream_internode = device.create_stream()
+
+        def _pick_stream_for_peer(peer_rank: int):
+            intranode = _is_cp_peer_intranode(int(peer_rank))
+            if intranode is True:
+                return communicate_stream_intranode
+            return communicate_stream_internode
         
         def flash_attn_p2p_communicate_nvshmem(
             rank,
@@ -1964,7 +1940,7 @@ class AttnFuncWithCPAndKVP2P(torch.autograd.Function):
                     recv_tensor,  # 目标：远程PE的接收缓冲区  
                     send_tensor,  # 源：本地发送数据  
                     remote_pe=send_dst,  
-                    stream=_as_nvshmem_stream(send_stream),
+                    stream=send_stream,
                 )  
                 
                 # 接收数据  
@@ -1972,7 +1948,7 @@ class AttnFuncWithCPAndKVP2P(torch.autograd.Function):
                     recv_tensor,  # 目标：本地接收缓冲区  
                     send_tensor,  # 源：远程PE的发送数据  
                     remote_pe=recv_src,  
-                    stream=_as_nvshmem_stream(recv_stream),
+                    stream=recv_stream,
                 )  
             else:  
                 # 奇数rank：先接收后发送  
@@ -1980,7 +1956,7 @@ class AttnFuncWithCPAndKVP2P(torch.autograd.Function):
                     recv_tensor,  # 目标：本地接收缓冲区  
                     send_tensor,  # 源：远程PE的发送数据  
                     remote_pe=recv_src,  
-                    stream=_as_nvshmem_stream(recv_stream),
+                    stream=recv_stream,
                 )  
                 
                 # 发送数据  
@@ -1988,14 +1964,15 @@ class AttnFuncWithCPAndKVP2P(torch.autograd.Function):
                     recv_tensor,  # 目标：远程PE的接收缓冲区  
                     send_tensor,  # 源：本地发送数据  
                     remote_pe=send_dst,  
-                    stream=_as_nvshmem_stream(send_stream),
+                    stream=send_stream,
                 )  
         
         for i in range(cp_size):
             # wait until KV is received
             # for req in send_recv_reqs:
             #     req.wait()
-            _sync_stream(communicate_stream)
+            communicate_stream_intranode.sync()
+            communicate_stream_internode.sync()
 
             send_tensor = p2p_comm_buffers[i % 2]
             recv_tensor = p2p_comm_buffers[(i + 1) % 2]
@@ -2023,8 +2000,8 @@ class AttnFuncWithCPAndKVP2P(torch.autograd.Function):
                         send_dst,
                         recv_tensor,
                         recv_src,
-                        communicate_stream,
-                        communicate_stream,
+                        _pick_stream_for_peer(send_dst),
+                        _pick_stream_for_peer(recv_src),
                     )  
                 else:
                     with _cp_comm_nvtx("cp_nvshmem.dkv_all_to_all_single"):
@@ -2057,8 +2034,8 @@ class AttnFuncWithCPAndKVP2P(torch.autograd.Function):
                     send_dst,
                     recv_tensor,
                     recv_src,
-                    communicate_stream,
-                    communicate_stream,
+                    _pick_stream_for_peer(send_dst),
+                    _pick_stream_for_peer(recv_src),
                 )
 
             kv = p2p_comm_buffers[i % 2][0]

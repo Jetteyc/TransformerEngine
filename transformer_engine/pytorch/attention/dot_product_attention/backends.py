@@ -6,6 +6,7 @@
 from contextlib import nullcontext
 from importlib.metadata import version as get_pkg_version
 from importlib.metadata import PackageNotFoundError
+import importlib
 import os
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 import warnings
@@ -42,11 +43,8 @@ from transformer_engine.pytorch.cpp_extensions.fused_attn import (
 from transformer_engine.pytorch.fp8 import get_fp8_torch_dtype
 from transformer_engine.pytorch.distributed import get_distributed_world_size
 from transformer_engine.pytorch.jit import no_torch_dynamo
-# from transformer_engine.pytorch.attention.dot_product_attention.context_parallel import (
-#     attn_forward_func_with_cp,
-# )
-from transformer_engine.pytorch.attention.dot_product_attention.context_parallel_nvshmem import (
-    attn_forward_func_with_cp,
+from transformer_engine.pytorch.attention.dot_product_attention.context_parallel import (
+    attn_forward_func_with_cp as _attn_forward_func_with_cp_torch_dist,
 )
 from transformer_engine.pytorch.attention.dot_product_attention.softmax import FusedScaleMaskSoftmax
 from transformer_engine.pytorch.attention.inference import InferenceParams
@@ -70,6 +68,76 @@ _flash_attn_fwd = None
 _flash_attn_bwd = None
 _flash_attn_varlen_fwd = None
 _flash_attn_varlen_bwd = None
+_CP_BACKEND_ROUTE_WARNED = set()
+
+
+def _warn_cp_backend_once(key: str, message: str) -> None:
+    if key in _CP_BACKEND_ROUTE_WARNED:
+        return
+    _CP_BACKEND_ROUTE_WARNED.add(key)
+    attn_log.fa_logger.warning(message)
+
+
+def _resolve_cp_backend_name(cp_global_ranks) -> str:
+    """Resolve CP backend name with best-effort integration to Megatron network engine."""
+    try:
+        ne_module = importlib.import_module("megatron.core.network_engine")
+        resolve_cp_backend_name_for_ranks = getattr(
+            ne_module,
+            "resolve_cp_backend_name_for_ranks",
+            None,
+        )
+        if resolve_cp_backend_name_for_ranks is None:
+            _warn_cp_backend_once(
+                "ne_helper_missing",
+                "CP backend resolver helper missing in megatron.core.network_engine; "
+                "fallback to torch_dist.",
+            )
+            return "torch_dist"
+
+        backend_name = resolve_cp_backend_name_for_ranks(cp_global_ranks)
+        if isinstance(backend_name, str) and backend_name:
+            return backend_name
+        _warn_cp_backend_once(
+            "ne_helper_invalid_return",
+            "CP backend resolver returned invalid value; fallback to torch_dist.",
+        )
+    except Exception as exc:
+        _warn_cp_backend_once(
+            "ne_import_or_call_failed",
+            "CP backend resolver import/call failed; fallback to torch_dist. "
+            f"error={exc}",
+        )
+    return "torch_dist"
+
+
+def _get_attn_forward_func_with_cp(cp_global_ranks):
+    """Get CP forward implementation based on backend routing policy."""
+    backend_name = _resolve_cp_backend_name(cp_global_ranks)
+    if backend_name == "nvshmem":
+        try:
+            from transformer_engine.pytorch.attention.dot_product_attention.context_parallel_nvshmem import (
+                attn_forward_func_with_cp as _attn_forward_func_with_cp_nvshmem,
+            )
+
+            return _attn_forward_func_with_cp_nvshmem
+        except Exception as exc:
+            _warn_cp_backend_once(
+                "nvshmem_import_failed",
+                "CP backend routed to nvshmem but context_parallel_nvshmem import failed; "
+                f"fallback to torch_dist. error={exc}",
+            )
+
+    if backend_name != "torch_dist":
+        _warn_cp_backend_once(
+            f"unsupported_backend_{backend_name}",
+            "CP backend resolver returned unsupported backend "
+            f"'{backend_name}'; fallback to torch_dist.",
+        )
+
+    return _attn_forward_func_with_cp_torch_dist
+
+
 try:
     fa_utils.version = PkgVersion(get_pkg_version("flash-attn"))
 except PackageNotFoundError:
@@ -672,8 +740,9 @@ class FlashAttention(torch.nn.Module):
             assert (
                 alibi_slopes is None
             ), "Alibi slope bias addition is not supported with context parallelism."
+            cp_attn_forward_func = _get_attn_forward_func_with_cp(cp_global_ranks)
             with self.attention_dropout_ctx():
-                output = attn_forward_func_with_cp(
+                output = cp_attn_forward_func(
                     self.training,
                     query_layer,
                     key_layer,
@@ -1577,8 +1646,9 @@ class FusedAttention(torch.nn.Module):
             query_layer, key_layer, value_layer = [
                 x.contiguous() for x in (query_layer, key_layer, value_layer)
             ]
+            cp_attn_forward_func = _get_attn_forward_func_with_cp(cp_global_ranks)
             with self.attention_dropout_ctx():
-                output = attn_forward_func_with_cp(
+                output = cp_attn_forward_func(
                     self.training,
                     query_layer,
                     key_layer,
